@@ -91,3 +91,103 @@ PLACES_FIELD_MASK = ",".join([
     "places.primaryType",
     "nextPageToken",
 ])
+
+# --- Business Type Classification ---
+
+# Maps search query keywords → clean category. Checked in order; first match wins.
+SEARCH_QUERY_TO_CATEGORY = [
+    ("dentist", "dentist"),
+    ("dental", "dentist"),
+    ("orthodontist", "orthodontist"),
+    ("periodontist", "periodontist"),
+    ("endodontist", "endodontist"),
+    ("oral surgeon", "oral_surgery"),
+    ("optometrist", "optometry"),
+    ("ophthalmologist", "optometry"),
+    ("dermatologist", "dermatology"),
+    ("skin care", "dermatology"),
+    ("podiatrist", "podiatry"),
+    ("urgent care", "urgent_care"),
+    ("physical therapy", "physical_therapy"),
+    ("physiotherapist", "physical_therapy"),
+    ("occupational therapy", "occupational_therapy"),
+    ("mental health", "mental_health_group"),
+    ("pediatrician", "pediatrics"),
+    ("obgyn", "obgyn"),
+    ("ent doctor", "ent"),
+    ("allergy", "allergy"),
+    ("chiropractor", "chiropractic"),
+    ("wellness center", "wellness_center"),
+    ("orthopedic", "orthopedic"),
+    ("pain management", "pain_management"),
+    ("radiology", "radiology"),
+    ("sports medicine", "sports_medicine"),
+    ("audiologist", "audiology"),
+    ("hearing aid", "audiology"),
+    ("sleep clinic", "sleep_clinic"),
+    ("med spa", "med_spa"),
+    ("acupuncture", "acupuncture"),
+    ("weight loss", "weight_loss"),
+    ("medical clinic", "medical_clinic"),
+]
+
+# Fallback: Google Places primary_type → category
+PRIMARY_TYPE_TO_CATEGORY = {
+    "doctor": "medical_clinic",
+    "dentist": "dentist",
+    "dental_clinic": "dentist",
+    "physiotherapist": "physical_therapy",
+    "chiropractor": "chiropractic",
+    "medical_clinic": "medical_clinic",
+    "health": "medical_clinic",
+    "hospital": "hospital_system",
+    "pharmacy": "pharmacy",
+    "veterinary_care": "veterinary",
+    "gym": "gym",
+    "university": "university",
+}
+
+# Tenant fitness tiers: 1=best fit, 2=good, 3=possible, 0=skip
+BUSINESS_TYPE_TIERS = {
+    "dentist": 1, "orthodontist": 1, "urgent_care": 1,
+    "physical_therapy": 1, "chiropractic": 1, "optometry": 1,
+    "med_spa": 1, "dermatology": 1,
+    "pediatrics": 2, "audiology": 2, "allergy": 2,
+    "weight_loss": 2, "pain_management": 2, "podiatry": 2,
+    "oral_surgery": 2, "sleep_clinic": 2, "wellness_center": 2,
+    "obgyn": 3, "ent": 3, "orthopedic": 3, "acupuncture": 3,
+    "mental_health_group": 3, "occupational_therapy": 3, "radiology": 3,
+    "sports_medicine": 3, "periodontist": 3, "endodontist": 3,
+    "medical_clinic": 3,
+    "hospital_system": 0, "home_health": 0, "solo_counselor": 0,
+    "veterinary": 0, "university": 0, "gym": 0, "pharmacy": 0,
+}
+
+# Known hospital/health system domains — not retail tenant prospects
+HOSPITAL_SYSTEM_DOMAINS = {
+    "missionhealth.org", "missionhealthphysicians.org", "adventhealth.com",
+    "pardeehospital.org", "mahec.net", "novanthealth.org", "va.gov",
+    "wncchs.org", "appalachianmountainhealth.org",
+}
+
+# Human-readable category labels
+CATEGORY_DISPLAY_NAMES = {
+    "dentist": "Dentist", "orthodontist": "Orthodontist",
+    "periodontist": "Periodontist", "endodontist": "Endodontist",
+    "oral_surgery": "Oral Surgery", "optometry": "Optometry",
+    "dermatology": "Dermatology", "podiatry": "Podiatry",
+    "urgent_care": "Urgent Care", "physical_therapy": "Physical Therapy",
+    "chiropractic": "Chiropractic",
+    "occupational_therapy": "Occupational Therapy",
+    "mental_health_group": "Mental Health", "pediatrics": "Pediatrics",
+    "obgyn": "OB/GYN", "ent": "ENT",
+    "allergy": "Allergy & Immunology", "medical_clinic": "Medical Clinic",
+    "wellness_center": "Wellness Center", "orthopedic": "Orthopedic",
+    "pain_management": "Pain Management", "radiology": "Radiology",
+    "sports_medicine": "Sports Medicine", "audiology": "Audiology",
+    "sleep_clinic": "Sleep Clinic", "med_spa": "Med Spa",
+    "acupuncture": "Acupuncture", "weight_loss": "Weight Loss",
+    "hospital_system": "Hospital System", "home_health": "Home Health",
+    "solo_counselor": "Solo Counselor", "veterinary": "Veterinary",
+    "university": "University", "gym": "Gym", "pharmacy": "Pharmacy",
+}

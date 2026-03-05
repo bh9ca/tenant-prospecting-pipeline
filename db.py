@@ -85,6 +85,23 @@ def init_db():
     print("Database initialized.")
 
 
+def migrate_db():
+    """Add columns that may not exist in older schemas."""
+    conn = get_connection()
+    biz_cols = {r[1] for r in conn.execute("PRAGMA table_info(businesses)").fetchall()}
+    org_cols = {r[1] for r in conn.execute("PRAGMA table_info(organizations)").fetchall()}
+
+    if "business_category" not in biz_cols:
+        conn.execute("ALTER TABLE businesses ADD COLUMN business_category TEXT")
+        print("Added business_category column to businesses table.")
+    if "distinct_location_count" not in org_cols:
+        conn.execute("ALTER TABLE organizations ADD COLUMN distinct_location_count INTEGER")
+        print("Added distinct_location_count column to organizations table.")
+
+    conn.commit()
+    conn.close()
+
+
 def upsert_business(conn, place_id, name, address, lat, lng, phone, website,
                     rating, rating_count, types, primary_type, search_query,
                     raw_json):
@@ -180,6 +197,22 @@ def update_multi_location_signals(conn, business_id, signals):
     conn.execute(
         "UPDATE businesses SET multi_location_signals = ? WHERE id = ?",
         (json.dumps(signals) if signals else None, business_id),
+    )
+
+
+def update_business_category(conn, business_id, category):
+    """Update business category for a business."""
+    conn.execute(
+        "UPDATE businesses SET business_category = ? WHERE id = ?",
+        (category, business_id),
+    )
+
+
+def update_org_distinct_locations(conn, org_id, distinct_count):
+    """Update distinct location count for an organization."""
+    conn.execute(
+        "UPDATE organizations SET distinct_location_count = ? WHERE id = ?",
+        (distinct_count, org_id),
     )
 
 

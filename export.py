@@ -1,4 +1,4 @@
-"""Export leads to CSV and Excel with priority ranking."""
+"""Export leads to CSV and Excel with tier-based ranking."""
 
 import csv
 import json
@@ -6,307 +6,309 @@ import os
 import sys
 from datetime import datetime
 
-from db import get_connection
+from config import (
+    BUSINESS_TYPE_TIERS,
+    CATEGORY_DISPLAY_NAMES,
+)
+from db import get_connection, migrate_db
 
-# Output directory
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "data")
 
 
-def get_ranked_leads(conn):
+def display_category(category):
+    """Convert internal category to human-readable label."""
+    return CATEGORY_DISPLAY_NAMES.get(category, category or "Unknown")
+
+
+def compute_tier(lead):
     """
-    Fetch all businesses with organization info, ranked by priority:
-    1. Multi-location businesses (most locations first)
-    2. Higher ratings
-    3. More reviews (established businesses)
+    Assign prospect tier A/B/C/D.
+
+    A = "Call This Week": Right type (tier 1-2), 2+ distinct locations, 10+ min drive
+    B = "Call This Month": Right type + expansion signals, or right type + strong reviews
+    C = "Keep On List": Right type but no expansion signals
+    D = "Skip": Hospital system, too close (<10 min), wrong type
     """
-    query = """
+    category = lead["business_category"] or ""
+    type_tier = BUSINESS_TYPE_TIERS.get(category, 3)
+    distinct_locs = lead["distinct_location_count"] or 1
+    drive_min = lead["drive_time_minutes"]
+    rating = lead["rating"] or 0
+    review_count = lead["rating_count"] or 0
+    has_signals = bool(lead["multi_location_signals"])
+
+    # Tier D: wrong business type
+    if type_tier == 0:
+        return "D"
+    # Tier D: already a neighbor
+    if drive_min is not None and drive_min < 10:
+        return "D"
+
+    # Tier A: proven multi-location chain, right type, right distance
+    if (type_tier in (1, 2) and distinct_locs >= 2
+            and drive_min is not None and drive_min >= 10):
+        return "A"
+
+    # Tier B checks
+    if type_tier in (1, 2):
+        if has_signals or distinct_locs >= 2:
+            return "B"
+        if (drive_min is not None and drive_min >= 10
+                and rating >= 4.0 and review_count >= 50):
+            return "B"
+    if type_tier == 3 and distinct_locs >= 2 and drive_min is not None and drive_min >= 10:
+        return "B"
+
+    return "C"
+
+
+def drive_time_sort_score(minutes):
+    """Score for sorting: 10-25 min sweet spot ranks highest."""
+    if minutes is None:
+        return 0
+    if 10 <= minutes <= 25:
+        return 2
+    return 1
+
+
+def get_all_leads(conn):
+    """Fetch all businesses with org info, compute tier, return sorted list of dicts."""
+    rows = conn.execute("""
         SELECT
-            b.id,
-            b.name,
-            b.address,
-            b.phone,
-            b.website,
-            b.email,
-            b.description,
-            b.rating,
-            b.rating_count,
-            b.primary_type,
-            b.drive_time_minutes,
-            b.drive_zone,
-            b.distance_miles,
-            b.lat,
-            b.lng,
-            b.search_query,
-            b.multi_location_signals,
-            o.name as org_name,
-            o.website_domain as org_domain,
-            o.location_count,
-            o.notes as org_notes
+            b.id, b.name, b.address, b.phone, b.website, b.email,
+            b.description, b.rating, b.rating_count, b.primary_type,
+            b.business_category, b.drive_time_minutes, b.drive_zone,
+            b.distance_miles, b.search_query, b.multi_location_signals,
+            o.name as org_name, o.website_domain as org_domain,
+            o.location_count, o.distinct_location_count
         FROM businesses b
         LEFT JOIN organizations o ON b.organization_id = o.id
-        ORDER BY
-            COALESCE(o.location_count, 1) DESC,
-            b.rating DESC NULLS LAST,
-            b.rating_count DESC NULLS LAST
-    """
-    return conn.execute(query).fetchall()
+    """).fetchall()
+
+    leads = []
+    for row in rows:
+        lead = dict(row)
+        lead["tier"] = compute_tier(lead)
+        leads.append(lead)
+
+    tier_order = {"A": 0, "B": 1, "C": 2, "D": 3}
+    leads.sort(key=lambda l: (
+        tier_order.get(l["tier"], 4),
+        -(l["distinct_location_count"] or 1),
+        -drive_time_sort_score(l["drive_time_minutes"]),
+        -(1 if l["email"] else 0),
+        -(l["rating"] or 0),
+        -(l["rating_count"] or 0),
+    ))
+
+    return leads
 
 
-def export_csv(conn, filename="leads.csv"):
-    """Export ranked leads to CSV."""
-    leads = get_ranked_leads(conn)
-    filepath = os.path.join(OUTPUT_DIR, filename)
+LEAD_CSV_HEADERS = [
+    "Tier", "Name", "Category", "Phone", "Email", "Website", "Address",
+    "Drive Time (min)", "Drive Zone", "Distinct Locations", "Org Name",
+    "Rating", "Reviews", "Description", "Multi-Location Signals",
+]
 
-    headers = [
-        "Rank", "Name", "Address", "Phone", "Website", "Email",
-        "Description", "Rating", "Reviews", "Type", "Drive Time (min)",
-        "Drive Zone", "Distance (mi)", "Org Name", "Locations",
-        "Multi-Location Signals", "Search Query",
+
+def lead_to_row(lead):
+    """Convert a lead dict to a CSV row."""
+    return [
+        lead["tier"],
+        lead["name"],
+        display_category(lead["business_category"]),
+        lead["phone"] or "",
+        lead["email"] or "",
+        lead["website"] or "",
+        lead["address"] or "",
+        lead["drive_time_minutes"] or "",
+        lead["drive_zone"] or "",
+        lead["distinct_location_count"] or 1,
+        lead["org_name"] or "",
+        lead["rating"] or "",
+        lead["rating_count"] or "",
+        lead["description"] or "",
+        lead["multi_location_signals"] or "",
     ]
+
+
+def export_ranked_csv(leads):
+    """Export all leads ranked by tier to CSV."""
+    filepath = os.path.join(OUTPUT_DIR, "leads_ranked.csv")
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(LEAD_CSV_HEADERS)
+        for lead in leads:
+            writer.writerow(lead_to_row(lead))
+    print(f"CSV exported: {filepath} ({len(leads)} leads)")
+
+
+def export_top_prospects_csv(leads):
+    """Export Tier A + B leads to CSV."""
+    top = [l for l in leads if l["tier"] in ("A", "B")]
+    filepath = os.path.join(OUTPUT_DIR, "top_prospects.csv")
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(LEAD_CSV_HEADERS)
+        for lead in top:
+            writer.writerow(lead_to_row(lead))
+    print(f"CSV exported: {filepath} ({len(top)} top prospects)")
+
+
+def export_organizations_csv(conn):
+    """Export multi-location organizations to CSV."""
+    orgs = conn.execute("""
+        SELECT
+            o.id, o.name, o.website_domain, o.location_count,
+            o.distinct_location_count,
+            GROUP_CONCAT(DISTINCT b.business_category) as categories,
+            GROUP_CONCAT(DISTINCT b.address, ' | ') as addresses
+        FROM organizations o
+        JOIN businesses b ON b.organization_id = o.id
+        WHERE o.distinct_location_count >= 2 OR o.location_count >= 2
+        GROUP BY o.id
+        ORDER BY o.distinct_location_count DESC, o.location_count DESC
+    """).fetchall()
+
+    filepath = os.path.join(OUTPUT_DIR, "organizations.csv")
+    headers = ["Org Name", "Domain", "Distinct Locations", "Total Entries",
+               "Category", "Addresses"]
 
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(headers)
-
-        for rank, lead in enumerate(leads, 1):
+        for org in orgs:
+            cats = (org["categories"] or "").split(",")
             writer.writerow([
-                rank,
-                lead["name"],
-                lead["address"],
-                lead["phone"],
-                lead["website"],
-                lead["email"] or "",
-                lead["description"] or "",
-                lead["rating"] or "",
-                lead["rating_count"] or "",
-                lead["primary_type"] or "",
-                lead["drive_time_minutes"] or "",
-                lead["drive_zone"] or "",
-                lead["distance_miles"] or "",
-                lead["org_name"] or "",
-                lead["location_count"] or 1,
-                lead["multi_location_signals"] or "",
-                lead["search_query"] or "",
+                org["name"],
+                org["website_domain"] or "",
+                org["distinct_location_count"] or 1,
+                org["location_count"] or 1,
+                display_category(cats[0] if cats else ""),
+                org["addresses"] or "",
             ])
 
-    print(f"CSV exported: {filepath} ({len(leads)} leads)")
-    return filepath
+    print(f"CSV exported: {filepath} ({len(orgs)} organizations)")
 
 
-def export_excel(conn, filename="leads.xlsx"):
-    """Export ranked leads to Excel with formatting."""
+def export_excel(conn, leads):
+    """Export to Excel with tier-based sheets."""
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.utils import get_column_letter
     except ImportError:
-        print("openpyxl not installed. Skipping Excel export. Install with: pip install openpyxl")
-        return None
+        print("openpyxl not installed. Skipping Excel export.")
+        return
 
-    leads = get_ranked_leads(conn)
-    filepath = os.path.join(OUTPUT_DIR, filename)
-
+    filepath = os.path.join(OUTPUT_DIR, "leads.xlsx")
     wb = Workbook()
 
-    # ── Sheet 1: All Leads (ranked) ──
-    ws = wb.active
-    ws.title = "All Leads"
-
     headers = [
-        "Rank", "Name", "Address", "Phone", "Website", "Email",
-        "Description", "Rating", "Reviews", "Type", "Drive Time (min)",
-        "Drive Zone", "Distance (mi)", "Org Name", "Locations",
-        "Multi-Location Signals", "Search Query",
+        "Rank", "Tier", "Name", "Category", "Phone", "Email", "Website",
+        "Address", "Drive Time (min)", "Drive Zone", "Distinct Locations",
+        "Org Name", "Rating", "Reviews", "Description",
     ]
 
-    # Header styling
     header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True, size=11)
+    tier_fills = {
+        "A": PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),
+        "B": PatternFill(start_color="D4EDDA", end_color="D4EDDA", fill_type="solid"),
+        "C": PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid"),
+        "D": PatternFill(start_color="F8D7DA", end_color="F8D7DA", fill_type="solid"),
+    }
 
-    for col, header in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col, value=header)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center")
+    def write_lead_sheet(ws, sheet_leads):
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=h)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
 
-    # Data rows
-    multi_loc_fill = PatternFill(start_color="D4EDDA", end_color="D4EDDA", fill_type="solid")
+        for rank, lead in enumerate(sheet_leads, 1):
+            row = rank + 1
+            values = [
+                rank, lead["tier"], lead["name"],
+                display_category(lead["business_category"]),
+                lead["phone"] or "", lead["email"] or "",
+                lead["website"] or "", lead["address"] or "",
+                lead["drive_time_minutes"], lead["drive_zone"] or "",
+                lead["distinct_location_count"] or 1,
+                lead["org_name"] or "", lead["rating"],
+                lead["rating_count"], lead["description"] or "",
+            ]
+            fill = tier_fills.get(lead["tier"])
+            for col, val in enumerate(values, 1):
+                cell = ws.cell(row=row, column=col, value=val)
+                if fill:
+                    cell.fill = fill
 
-    for rank, lead in enumerate(leads, 1):
-        row = rank + 1
-        values = [
-            rank,
-            lead["name"],
-            lead["address"],
-            lead["phone"],
-            lead["website"],
-            lead["email"] or "",
-            lead["description"] or "",
-            lead["rating"],
-            lead["rating_count"],
-            lead["primary_type"] or "",
-            lead["drive_time_minutes"],
-            lead["drive_zone"] or "",
-            lead["distance_miles"],
-            lead["org_name"] or "",
-            lead["location_count"] or 1,
-            lead["multi_location_signals"] or "",
-            lead["search_query"] or "",
-        ]
+        for col in range(1, len(headers) + 1):
+            max_len = max(
+                len(str(ws.cell(row=r, column=col).value or ""))
+                for r in range(1, min(len(sheet_leads) + 2, 100))
+            )
+            ws.column_dimensions[get_column_letter(col)].width = min(max_len + 2, 40)
 
-        for col, value in enumerate(values, 1):
-            cell = ws.cell(row=row, column=col, value=value)
-            # Highlight multi-location businesses in green
-            if (lead["location_count"] or 1) > 1:
-                cell.fill = multi_loc_fill
+        ws.freeze_panes = "A2"
 
-    # Auto-width columns
-    from openpyxl.utils import get_column_letter
-    for col in range(1, len(headers) + 1):
-        max_len = max(
-            len(str(ws.cell(row=r, column=col).value or ""))
-            for r in range(1, min(len(leads) + 2, 100))
-        )
-        ws.column_dimensions[get_column_letter(col)].width = min(max_len + 2, 40)
+    # Sheet 1: All Leads
+    ws1 = wb.active
+    ws1.title = "All Leads"
+    write_lead_sheet(ws1, leads)
 
-    # Freeze header row
-    ws.freeze_panes = "A2"
+    # Sheet 2: Top Prospects (A + B)
+    top = [l for l in leads if l["tier"] in ("A", "B")]
+    ws2 = wb.create_sheet("Top Prospects")
+    write_lead_sheet(ws2, top)
 
-    # ── Sheet 2: Multi-Location Targets ──
-    ws2 = wb.create_sheet("Multi-Location Targets")
-
-    headers2 = [
-        "Org Name", "Domain", "Locations", "Businesses",
-    ]
-
-    for col, header in enumerate(headers2, 1):
-        cell = ws2.cell(row=1, column=col, value=header)
+    # Sheet 3: Multi-Location Orgs
+    ws3 = wb.create_sheet("Multi-Location Orgs")
+    org_headers = ["Org Name", "Domain", "Distinct Locations", "Total Entries"]
+    for col, h in enumerate(org_headers, 1):
+        cell = ws3.cell(row=1, column=col, value=h)
         cell.fill = header_fill
         cell.font = header_font
 
     orgs = conn.execute("""
-        SELECT o.name, o.website_domain, o.location_count,
-               GROUP_CONCAT(b.name, ' | ') as businesses
-        FROM organizations o
-        JOIN businesses b ON b.organization_id = o.id
-        WHERE o.location_count > 1
-        GROUP BY o.id
-        ORDER BY o.location_count DESC
+        SELECT name, website_domain, distinct_location_count, location_count
+        FROM organizations
+        WHERE distinct_location_count >= 2 OR location_count >= 2
+        ORDER BY distinct_location_count DESC, location_count DESC
     """).fetchall()
 
     for i, org in enumerate(orgs, 2):
-        ws2.cell(row=i, column=1, value=org["name"])
-        ws2.cell(row=i, column=2, value=org["website_domain"] or "")
-        ws2.cell(row=i, column=3, value=org["location_count"])
-        ws2.cell(row=i, column=4, value=org["businesses"])
-
-    ws2.freeze_panes = "A2"
-
-    # ── Sheet 3: Summary Stats ──
-    ws3 = wb.create_sheet("Summary")
-
-    stats_header_font = Font(bold=True, size=12)
-
-    ws3.cell(row=1, column=1, value="Healthcare Tenant Lead Summary").font = Font(bold=True, size=14)
-    ws3.cell(row=2, column=1, value=f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-
-    row = 4
-    ws3.cell(row=row, column=1, value="Total Businesses").font = stats_header_font
-    ws3.cell(row=row, column=2, value=len(leads))
-
-    # By drive zone
-    row += 2
-    ws3.cell(row=row, column=1, value="By Drive Zone").font = stats_header_font
-    row += 1
-    zone_counts = conn.execute("""
-        SELECT drive_zone, COUNT(*) as cnt FROM businesses
-        WHERE drive_zone IS NOT NULL
-        GROUP BY drive_zone ORDER BY
-        CASE drive_zone
-            WHEN '<10 min' THEN 1
-            WHEN '10-15 min' THEN 2
-            WHEN '15-20 min' THEN 3
-            WHEN '20+ min' THEN 4
-        END
-    """).fetchall()
-    for z in zone_counts:
-        ws3.cell(row=row, column=1, value=z["drive_zone"])
-        ws3.cell(row=row, column=2, value=z["cnt"])
-        row += 1
-
-    # By type
-    row += 1
-    ws3.cell(row=row, column=1, value="By Business Type").font = stats_header_font
-    row += 1
-    type_counts = conn.execute("""
-        SELECT primary_type, COUNT(*) as cnt FROM businesses
-        WHERE primary_type IS NOT NULL AND primary_type != ''
-        GROUP BY primary_type ORDER BY cnt DESC
-    """).fetchall()
-    for t in type_counts:
-        ws3.cell(row=row, column=1, value=t["primary_type"])
-        ws3.cell(row=row, column=2, value=t["cnt"])
-        row += 1
-
-    # Multi-location count
-    row += 1
-    ws3.cell(row=row, column=1, value="Multi-Location Organizations").font = stats_header_font
-    ws3.cell(row=row, column=2, value=len(orgs))
+        ws3.cell(row=i, column=1, value=org["name"])
+        ws3.cell(row=i, column=2, value=org["website_domain"] or "")
+        ws3.cell(row=i, column=3, value=org["distinct_location_count"] or 1)
+        ws3.cell(row=i, column=4, value=org["location_count"] or 1)
+    ws3.freeze_panes = "A2"
 
     wb.save(filepath)
-    print(f"Excel exported: {filepath} ({len(leads)} leads, {len(orgs)} multi-location orgs)")
-    return filepath
+    print(f"Excel exported: {filepath}")
 
 
-def print_summary(conn):
-    """Print a text summary of the leads database."""
-    total = conn.execute("SELECT COUNT(*) FROM businesses").fetchone()[0]
-    with_email = conn.execute("SELECT COUNT(*) FROM businesses WHERE email IS NOT NULL").fetchone()[0]
-    multi_loc = conn.execute(
-        "SELECT COUNT(*) FROM organizations WHERE location_count > 1"
-    ).fetchone()[0]
+def print_summary(leads):
+    """Print tier summary to stdout."""
+    tier_counts = {"A": 0, "B": 0, "C": 0, "D": 0}
+    for lead in leads:
+        tier_counts[lead["tier"]] = tier_counts.get(lead["tier"], 0) + 1
 
-    print("\n" + "=" * 50)
-    print("LEAD GENERATION SUMMARY")
-    print("=" * 50)
-    print(f"Total businesses collected: {total}")
-    print(f"With email addresses: {with_email}")
-    print(f"Multi-location organizations: {multi_loc}")
+    print(f"\nTier A (Call This Week): {tier_counts['A']} leads")
+    print(f"Tier B (Call This Month): {tier_counts['B']} leads")
+    print(f"Tier C (Keep On List): {tier_counts['C']} leads")
+    print(f"Tier D (Skip): {tier_counts['D']} leads")
 
-    # Top multi-location orgs
-    top_orgs = conn.execute("""
-        SELECT o.name, o.location_count, o.website_domain
-        FROM organizations o
-        WHERE o.location_count > 1
-        ORDER BY o.location_count DESC
-        LIMIT 10
-    """).fetchall()
-
-    if top_orgs:
-        print("\nTop Multi-Location Organizations:")
-        for org in top_orgs:
-            print(f"  {org['name']} — {org['location_count']} locations ({org['website_domain'] or 'no website'})")
-
-    # Drive zone breakdown
-    zones = conn.execute("""
-        SELECT drive_zone, COUNT(*) as cnt FROM businesses
-        WHERE drive_zone IS NOT NULL
-        GROUP BY drive_zone ORDER BY
-        CASE drive_zone
-            WHEN '<10 min' THEN 1
-            WHEN '10-15 min' THEN 2
-            WHEN '15-20 min' THEN 3
-            WHEN '20+ min' THEN 4
-        END
-    """).fetchall()
-
-    if zones:
-        print("\nDrive Time Zones:")
-        for z in zones:
-            print(f"  {z['drive_zone']}: {z['cnt']} businesses")
+    if tier_counts["A"] < 5:
+        print(f"\n  Note: Only {tier_counts['A']} Tier A leads — scoring may need calibration.")
+    elif tier_counts["A"] > 200:
+        print(f"\n  Note: {tier_counts['A']} Tier A leads — scoring may be too generous.")
 
 
 def run_export():
     """Run the full export pipeline."""
+    migrate_db()
     conn = get_connection()
 
     total = conn.execute("SELECT COUNT(*) FROM businesses").fetchone()[0]
@@ -317,9 +319,12 @@ def run_export():
 
     print(f"Exporting {total} businesses...\n")
 
-    export_csv(conn)
-    export_excel(conn)
-    print_summary(conn)
+    leads = get_all_leads(conn)
+    export_ranked_csv(leads)
+    export_top_prospects_csv(leads)
+    export_organizations_csv(conn)
+    export_excel(conn, leads)
+    print_summary(leads)
 
     conn.close()
 

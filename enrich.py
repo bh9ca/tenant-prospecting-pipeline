@@ -17,6 +17,9 @@ from config import (
     PROPERTY_LNG,
     DRIVE_ZONES,
     ROUTES_MATRIX_URL,
+    SEARCH_QUERY_TO_CATEGORY,
+    PRIMARY_TYPE_TO_CATEGORY,
+    HOSPITAL_SYSTEM_DOMAINS,
 )
 from db import (
     get_connection,
@@ -27,7 +30,10 @@ from db import (
     update_email,
     update_description,
     update_multi_location_signals,
+    update_business_category,
+    update_org_distinct_locations,
     create_organization,
+    migrate_db,
     get_stats,
 )
 
@@ -199,6 +205,104 @@ def normalize_name(name):
                   r'north|south|east|west|downtown).*$', '', name, flags=re.IGNORECASE)
     name = re.sub(r'[^a-z0-9\s]', '', name)
     return name.strip()
+
+
+def normalize_address(address):
+    """
+    Normalize address to canonical building key for dedup within an org.
+
+    Google Places format: "123 Main St Suite 200, Asheville, NC 28801, USA"
+    Sometimes: "Building Name, 123 Main St, Asheville, NC 28801, USA"
+    Returns: "{number} {street}, {city}" as canonical key.
+    """
+    if not address:
+        return ""
+
+    addr = address.lower().strip()
+    # Remove country suffix
+    addr = re.sub(r',?\s*usa?\s*$', '', addr)
+
+    parts = [p.strip() for p in addr.split(',')]
+
+    # Find the street part (first comma-segment starting with a digit)
+    street = None
+    city_idx = None
+    for i, part in enumerate(parts):
+        if re.match(r'\d', part.strip()):
+            street = part.strip()
+            city_idx = i + 1
+            break
+
+    if street is None:
+        # No numbered street found, return first two parts as-is
+        return ', '.join(parts[:2]) if len(parts) >= 2 else addr
+
+    city = parts[city_idx].strip() if city_idx and city_idx < len(parts) else ""
+
+    # Strip suite/unit/floor designators
+    street = re.sub(
+        r'\s*[,.]?\s*(?:suite|ste|unit|apt|#|room|rm|bldg|building)\s*\.?\s*[\w-]*',
+        '', street
+    )
+    street = re.sub(r'\s*,?\s*\d+(?:st|nd|rd|th)\s+(?:floor|fl)\b', '', street)
+
+    # Normalize letter suffixes on building number: "75a" or "75 b" → "75"
+    street = re.sub(r'^(\d+)\s*[a-z]\b', r'\1', street)
+
+    # Standardize street type abbreviations
+    for full, abbr in [('street', 'st'), ('avenue', 'ave'), ('road', 'rd'),
+                        ('drive', 'dr'), ('boulevard', 'blvd'), ('lane', 'ln'),
+                        ('court', 'ct'), ('place', 'pl'), ('parkway', 'pkwy'),
+                        ('highway', 'hwy'), ('circle', 'cir')]:
+        street = re.sub(r'\b' + full + r'\b', abbr, street)
+
+    street = ' '.join(street.split())
+    return f"{street}, {city}" if city else street
+
+
+def classify_business_type(business):
+    """
+    Classify a business into a category using search_query keywords first,
+    then hospital system domain check, then primary_type fallback.
+    """
+    domain = extract_domain(business["website"])
+    if domain and domain in HOSPITAL_SYSTEM_DOMAINS:
+        return "hospital_system"
+
+    search_query = (business["search_query"] or "").lower()
+    for keyword, category in SEARCH_QUERY_TO_CATEGORY:
+        if keyword in search_query:
+            return category
+
+    primary_type = business["primary_type"] or ""
+    if primary_type in PRIMARY_TYPE_TO_CATEGORY:
+        return PRIMARY_TYPE_TO_CATEGORY[primary_type]
+
+    return "medical_clinic"
+
+
+def classify_all_business_types():
+    """Classify all businesses into categories."""
+    conn = get_connection()
+    businesses = get_all_businesses(conn)
+
+    for biz in businesses:
+        category = classify_business_type(biz)
+        update_business_category(conn, biz["id"], category)
+
+    conn.commit()
+
+    counts = conn.execute("""
+        SELECT business_category, COUNT(*) as cnt
+        FROM businesses WHERE business_category IS NOT NULL
+        GROUP BY business_category ORDER BY cnt DESC
+    """).fetchall()
+
+    print(f"Classified {len(businesses)} businesses:")
+    for row in counts:
+        print(f"  {row['business_category']}: {row['cnt']}")
+
+    conn.close()
 
 
 MULTI_LOCATION_KEYWORDS = [
@@ -376,8 +480,21 @@ def scrape_all_websites():
 
 
 def detect_multi_location_orgs():
-    """Group businesses into organizations based on website domain, name similarity, and website signals."""
+    """
+    Group businesses into organizations and count distinct physical locations.
+
+    Three cases for address dedup:
+    1. Same address, DIFFERENT domains → separate orgs (independent practices). No dedup.
+    2. Same address, SAME domain → same org, one location. Dedup via address normalization.
+    3. Different addresses, SAME domain → same org, multiple locations.
+    """
     conn = get_connection()
+
+    # Clear existing orgs for clean re-run (org data is fully derived from businesses)
+    conn.execute("UPDATE businesses SET organization_id = NULL")
+    conn.execute("DELETE FROM organizations")
+    conn.commit()
+
     businesses = get_all_businesses(conn)
 
     # Group by website domain
@@ -404,49 +521,70 @@ def detect_multi_location_orgs():
         org_name = min([b["name"] for b in group], key=len)
         location_count = len(group)
 
-        # Check if any business in this group has multi-location signals from website
-        has_website_signals = False
+        # Count distinct physical locations by normalized address
+        addr_map = defaultdict(list)
         for biz in group:
-            if biz["multi_location_signals"]:
-                has_website_signals = True
-                break
+            norm_addr = normalize_address(biz["address"])
+            addr_map[norm_addr].append(biz)
+        distinct_count = len(addr_map)
 
-        # If website signals detected on a single-location domain, bump count
+        # Lat/lng proximity warning: flag if different normalized addresses are within 100m
+        addrs = list(addr_map.keys())
+        for i in range(len(addrs)):
+            for j in range(i + 1, len(addrs)):
+                biz_i = addr_map[addrs[i]][0]
+                biz_j = addr_map[addrs[j]][0]
+                if biz_i["lat"] and biz_i["lng"] and biz_j["lat"] and biz_j["lng"]:
+                    dist = haversine_miles(biz_i["lat"], biz_i["lng"],
+                                           biz_j["lat"], biz_j["lng"])
+                    if dist < 0.062:  # ~100m
+                        print(f"  Warning: {org_name} has close addresses ({int(dist * 1609)}m):")
+                        print(f"    {addrs[i]}")
+                        print(f"    {addrs[j]}")
+
+        has_website_signals = any(biz["multi_location_signals"] for biz in group)
+
+        notes = None
+        if domain in HOSPITAL_SYSTEM_DOMAINS:
+            notes = "Hospital/health system"
         if location_count == 1 and has_website_signals:
-            notes = "Multi-location detected via website signals"
-            org_id = create_organization(conn, org_name, domain,
-                                         location_count=2, notes=notes)
-            update_organization(conn, group[0]["id"], org_id)
-            orgs_created += 1
-            print(f"  Multi-location (website signals): {org_name} ({domain})")
-        elif location_count >= 2:
-            org_id = create_organization(conn, org_name, domain,
-                                         location_count=location_count)
-            for biz in group:
-                update_organization(conn, biz["id"], org_id)
-            orgs_created += 1
-            print(f"  Multi-location: {org_name} ({domain}) — {location_count} locations")
-        else:
-            # Single location, still create org for tracking
-            biz = group[0]
-            org_id = create_organization(conn, biz["name"], domain, location_count=1)
+            notes = (notes + "; " if notes else "") + "Multi-location via website signals"
+
+        org_id = create_organization(conn, org_name, domain,
+                                     location_count=location_count, notes=notes)
+        update_org_distinct_locations(conn, org_id, distinct_count)
+
+        for biz in group:
             update_organization(conn, biz["id"], org_id)
+
+        if location_count >= 2 or has_website_signals:
+            orgs_created += 1
+            print(f"  Multi-location: {org_name} ({domain}) — "
+                  f"{distinct_count} distinct / {location_count} entries")
 
     # Create organizations for name groups
     for norm_name, group in name_groups.items():
         if len(group) >= 2:
             org_name = min([b["name"] for b in group], key=len)
+            addr_map = defaultdict(list)
+            for biz in group:
+                norm_addr = normalize_address(biz["address"])
+                addr_map[norm_addr].append(biz)
+            distinct_count = len(addr_map)
+
             org_id = create_organization(conn, org_name, None,
                                          location_count=len(group),
                                          notes="Matched by name similarity")
+            update_org_distinct_locations(conn, org_id, distinct_count)
             for biz in group:
                 update_organization(conn, biz["id"], org_id)
             orgs_created += 1
-            print(f"  Multi-location (name match): {org_name} — {len(group)} locations")
+            print(f"  Multi-location (name match): {org_name} — "
+                  f"{distinct_count} distinct / {len(group)} entries")
 
     conn.commit()
     conn.close()
-    print(f"\nOrganizations created: {orgs_created} multi-location groups found.")
+    print(f"\nOrganizations: {orgs_created} multi-location groups found.")
 
 
 # ── Main ────────────────────────────────────────────────────────────────
@@ -457,6 +595,8 @@ def run_enrichment():
     if not GOOGLE_API_KEY:
         print("ERROR: GOOGLE_API_KEY not set.")
         sys.exit(1)
+
+    migrate_db()
 
     print("=" * 50)
     print("STEP 1: Calculate drive times")
@@ -469,7 +609,12 @@ def run_enrichment():
     scrape_all_websites()
 
     print("\n" + "=" * 50)
-    print("STEP 3: Detect multi-location organizations")
+    print("STEP 3: Classify business types")
+    print("=" * 50)
+    classify_all_business_types()
+
+    print("\n" + "=" * 50)
+    print("STEP 4: Detect multi-location organizations")
     print("=" * 50)
     detect_multi_location_orgs()
 
