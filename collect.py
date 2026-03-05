@@ -14,7 +14,33 @@ from config import (
     PLACES_TEXT_SEARCH_URL,
     PLACES_FIELD_MASK,
 )
-from db import get_connection, init_db, upsert_business
+from db import get_connection, init_db, upsert_business, log_search, is_search_done
+
+
+def validate_api_key():
+    """Run a single test search to verify the API key works. Abort if not."""
+    print("Validating API key...")
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_API_KEY,
+        "X-Goog-FieldMask": "places.id",
+    }
+    body = {
+        "textQuery": "dentist in Asheville NC",
+        "maxResultCount": 1,
+    }
+    try:
+        resp = requests.post(PLACES_TEXT_SEARCH_URL, json=body, headers=headers, timeout=10)
+    except requests.RequestException as e:
+        print(f"ERROR: Could not reach Google Places API: {e}")
+        sys.exit(1)
+
+    if resp.status_code != 200:
+        print(f"ERROR: API key validation failed ({resp.status_code}): {resp.text[:300]}")
+        print("Check that your GOOGLE_API_KEY is valid and Places API (New) is enabled.")
+        sys.exit(1)
+
+    print("API key valid.\n")
 
 
 def text_search(query, included_type=None, page_token=None):
@@ -108,57 +134,62 @@ def parse_place(place, search_query):
     }
 
 
+def run_search(conn, query, included_type=None):
+    """Run a single search query, log it, and insert results. Returns (inserted, dupes)."""
+    if is_search_done(conn, query, included_type):
+        print(f"  (skipped — already in search_log)")
+        return 0, 0
+
+    places = collect_all_pages(query, included_type=included_type)
+
+    inserted, dupes = 0, 0
+    for place in places:
+        parsed = parse_place(place, query)
+        if upsert_business(conn, **parsed):
+            inserted += 1
+        else:
+            dupes += 1
+
+    # Log this search
+    capped = len(places) >= 60
+    log_search(conn, query, included_type, ASHEVILLE_LAT, ASHEVILLE_LNG,
+               SEARCH_RADIUS_METERS, len(places), capped)
+    conn.commit()
+
+    if capped:
+        print(f"  *** WARNING: Hit 60-result cap! Results may be truncated. ***")
+
+    print(f"  -> {inserted} new, {dupes} duplicates (total {len(places)} results)")
+    return inserted, dupes
+
+
 def run_collection():
     """Run the full data collection pipeline."""
     if not GOOGLE_API_KEY:
-        print("ERROR: GOOGLE_API_KEY not set. Copy .env.example to .env and add your key.")
+        print("ERROR: GOOGLE_API_KEY not set in .env file.")
         sys.exit(1)
 
+    validate_api_key()
     init_db()
     conn = get_connection()
 
     total_inserted = 0
     total_dupes = 0
-    api_calls = 0
 
     # --- Type-based searches ---
     for place_type in TYPE_SEARCHES:
         query = f"{place_type} in Asheville NC"
         print(f"\n[TYPE] Searching: {query} (includedType={place_type})")
-        places = collect_all_pages(query, included_type=place_type)
-        api_calls += (len(places) // 20) + 1
-
-        inserted, dupes = 0, 0
-        for place in places:
-            parsed = parse_place(place, query)
-            if upsert_business(conn, **parsed):
-                inserted += 1
-            else:
-                dupes += 1
-
-        conn.commit()
+        inserted, dupes = run_search(conn, query, included_type=place_type)
         total_inserted += inserted
         total_dupes += dupes
-        print(f"  -> {inserted} new, {dupes} duplicates")
 
     # --- Text-based searches ---
     for query in TEXT_SEARCHES:
         print(f"\n[TEXT] Searching: {query}")
-        places = collect_all_pages(query)
-        api_calls += (len(places) // 20) + 1
-
-        inserted, dupes = 0, 0
-        for place in places:
-            parsed = parse_place(place, query)
-            if upsert_business(conn, **parsed):
-                inserted += 1
-            else:
-                dupes += 1
-
-        conn.commit()
+        inserted, dupes = run_search(conn, query)
         total_inserted += inserted
         total_dupes += dupes
-        print(f"  -> {inserted} new, {dupes} duplicates")
 
     conn.close()
 
@@ -166,7 +197,6 @@ def run_collection():
     print(f"Collection complete!")
     print(f"  Total new businesses: {total_inserted}")
     print(f"  Total duplicates skipped: {total_dupes}")
-    print(f"  Estimated API calls: {api_calls}")
 
 
 if __name__ == "__main__":

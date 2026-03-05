@@ -1,6 +1,7 @@
 """Database setup and helper functions for leads database."""
 
 import json
+import os
 import sqlite3
 from config import DB_PATH
 
@@ -16,6 +17,7 @@ def get_connection():
 
 def init_db():
     """Create database tables if they don't exist."""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = get_connection()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS organizations (
@@ -36,6 +38,7 @@ def init_db():
             phone TEXT,
             website TEXT,
             email TEXT,
+            description TEXT,
             rating REAL,
             rating_count INTEGER,
             types TEXT,
@@ -45,6 +48,7 @@ def init_db():
             drive_time_minutes REAL,
             drive_zone TEXT,
             organization_id INTEGER,
+            multi_location_signals TEXT,
             raw_json TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (organization_id) REFERENCES organizations(id)
@@ -58,6 +62,18 @@ def init_db():
             notes TEXT,
             status TEXT,
             FOREIGN KEY (business_id) REFERENCES businesses(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS search_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            query TEXT NOT NULL,
+            included_type TEXT,
+            lat REAL,
+            lng REAL,
+            radius_meters INTEGER,
+            result_count INTEGER,
+            capped BOOLEAN DEFAULT FALSE,
+            searched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE INDEX IF NOT EXISTS idx_businesses_place_id ON businesses(place_id);
@@ -85,8 +101,32 @@ def upsert_business(conn, place_id, name, address, lat, lng, phone, website,
         )
         return True
     except sqlite3.IntegrityError:
-        # Already exists (duplicate place_id)
         return False
+
+
+def log_search(conn, query, included_type, lat, lng, radius_meters, result_count, capped):
+    """Log a completed search query."""
+    conn.execute(
+        """INSERT INTO search_log
+           (query, included_type, lat, lng, radius_meters, result_count, capped)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (query, included_type, lat, lng, radius_meters, result_count, capped),
+    )
+
+
+def is_search_done(conn, query, included_type=None):
+    """Check if a search query has already been completed."""
+    if included_type:
+        row = conn.execute(
+            "SELECT id FROM search_log WHERE query = ? AND included_type = ?",
+            (query, included_type),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT id FROM search_log WHERE query = ? AND included_type IS NULL",
+            (query,),
+        ).fetchone()
+    return row is not None
 
 
 def get_all_businesses(conn):
@@ -124,6 +164,22 @@ def update_email(conn, business_id, email):
     conn.execute(
         "UPDATE businesses SET email = ? WHERE id = ?",
         (email, business_id),
+    )
+
+
+def update_description(conn, business_id, description):
+    """Update meta description for a business."""
+    conn.execute(
+        "UPDATE businesses SET description = ? WHERE id = ?",
+        (description, business_id),
+    )
+
+
+def update_multi_location_signals(conn, business_id, signals):
+    """Update multi-location signals (JSON) for a business."""
+    conn.execute(
+        "UPDATE businesses SET multi_location_signals = ? WHERE id = ?",
+        (json.dumps(signals) if signals else None, business_id),
     )
 
 

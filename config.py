@@ -9,8 +9,8 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # --- Property Location ---
 # Shops on Rockwood, 330-336 Rockwood Rd, Arden, NC 28704
-PROPERTY_LAT = 35.4700
-PROPERTY_LNG = -82.5170
+PROPERTY_LAT = 35.4444
+PROPERTY_LNG = -82.5366
 
 # --- Search Configuration ---
 # Center of Asheville for location biasing
@@ -49,6 +49,17 @@ TEXT_SEARCHES = [
     "dental clinic in Asheville NC",
     "skin care clinic in Asheville NC",
     "wellness center in Asheville NC",
+    "periodontist in Asheville NC",
+    "endodontist in Asheville NC",
+    "orthopedic doctor in Asheville NC",
+    "pain management clinic in Asheville NC",
+    "radiology imaging center in Asheville NC",
+    "sports medicine in Asheville NC",
+    "audiologist hearing aid in Asheville NC",
+    "sleep clinic in Asheville NC",
+    "med spa in Asheville NC",
+    "acupuncture in Asheville NC",
+    "weight loss clinic in Asheville NC",
 ]
 
 # --- Drive Time Zones ---

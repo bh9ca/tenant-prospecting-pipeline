@@ -1,5 +1,6 @@
-"""Enrich businesses with drive times, organization detection, and email extraction."""
+"""Enrich businesses with drive times, organization detection, and website scraping."""
 
+import json
 import math
 import re
 import sys
@@ -8,6 +9,7 @@ from collections import defaultdict
 from urllib.parse import urlparse
 
 import requests
+from bs4 import BeautifulSoup
 
 from config import (
     GOOGLE_API_KEY,
@@ -23,6 +25,8 @@ from db import (
     update_drive_time,
     update_organization,
     update_email,
+    update_description,
+    update_multi_location_signals,
     create_organization,
     get_stats,
 )
@@ -177,7 +181,6 @@ def extract_domain(url):
     try:
         parsed = urlparse(url if url.startswith("http") else f"https://{url}")
         domain = parsed.netloc.lower()
-        # Strip www.
         if domain.startswith("www."):
             domain = domain[4:]
         return domain if domain else None
@@ -188,21 +191,192 @@ def extract_domain(url):
 def normalize_name(name):
     """Normalize a business name for fuzzy matching."""
     name = name.lower()
-    # Remove common suffixes
     for suffix in [", pc", ", pa", ", pllc", ", llc", ", inc", ", md",
                    ", dds", ", dmd", ", do", ", od", " pc", " pa", " pllc"]:
         name = name.replace(suffix, "")
-    # Remove location qualifiers
     name = re.sub(r'\s*[-–—|]\s*(asheville|arden|hendersonville|fletcher|'
                   r'weaverville|black mountain|brevard|waynesville|canton|'
                   r'north|south|east|west|downtown).*$', '', name, flags=re.IGNORECASE)
-    # Remove non-alphanumeric
     name = re.sub(r'[^a-z0-9\s]', '', name)
     return name.strip()
 
 
+MULTI_LOCATION_KEYWORDS = [
+    "locations", "our offices", "find us", "our locations",
+    "clinic locations", "office locations", "multiple locations",
+    "our practices", "find a location",
+]
+
+# Regex to detect street addresses (e.g., "123 Main St")
+ADDRESS_PATTERN = re.compile(r'\b\d{1,5}\s+[A-Z][a-z]+\s+(?:St|Ave|Rd|Dr|Blvd|Ln|Way|Ct|Pl|Pkwy|Hwy)\b')
+
+
+def scrape_website(website_url):
+    """
+    Single-pass website scraping. Visits homepage + /contact + /about and extracts:
+    1. Email addresses
+    2. Meta description
+    3. Multi-location signals (link text, headings, address count)
+
+    Returns: (email, description, signals_list)
+    """
+    if not website_url:
+        return None, None, []
+
+    if not website_url.startswith("http"):
+        website_url = f"https://{website_url}"
+
+    paths_to_try = ["", "/contact", "/contact-us", "/about", "/about-us"]
+    all_emails = []
+    description = None
+    signals = []
+    addresses_found = set()
+
+    for path in paths_to_try:
+        url = website_url.rstrip("/") + path
+        try:
+            resp = requests.get(url, timeout=8, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; LeadGen/1.0)"
+            })
+            if resp.status_code != 200:
+                continue
+        except Exception:
+            continue
+
+        html = resp.text
+        soup = BeautifulSoup(html, "html.parser")
+
+        # --- Email extraction ---
+        emails = extract_emails_from_html(html)
+        all_emails.extend(emails)
+
+        # --- Meta description (take from first page that has one) ---
+        if not description:
+            meta = (soup.find("meta", attrs={"name": "description"}) or
+                    soup.find("meta", attrs={"property": "og:description"}))
+            if meta and meta.get("content"):
+                description = meta["content"].strip()[:500]
+
+        # --- Multi-location signals ---
+        # Scan <a> tags for location keywords
+        for a_tag in soup.find_all("a"):
+            link_text = (a_tag.get_text() or "").strip().lower()
+            for keyword in MULTI_LOCATION_KEYWORDS:
+                if keyword in link_text:
+                    signals.append({"source": "website_link", "text": a_tag.get_text().strip(), "page": path or "/"})
+                    break
+
+        # Scan headings for location keywords
+        for tag in soup.find_all(["h1", "h2", "h3", "h4"]):
+            heading_text = (tag.get_text() or "").strip().lower()
+            for keyword in MULTI_LOCATION_KEYWORDS:
+                if keyword in heading_text:
+                    signals.append({"source": "heading", "text": tag.get_text().strip(), "page": path or "/"})
+                    break
+
+        # Count distinct street addresses
+        found = ADDRESS_PATTERN.findall(html)
+        addresses_found.update(found)
+
+    # 3+ distinct addresses suggests multi-location
+    if len(addresses_found) >= 3:
+        signals.append({"source": "address_count", "count": len(addresses_found)})
+
+    # Deduplicate signals by text
+    seen = set()
+    unique_signals = []
+    for s in signals:
+        key = s.get("text", s.get("count", ""))
+        if key not in seen:
+            seen.add(key)
+            unique_signals.append(s)
+
+    email = list(set(all_emails))[0] if all_emails else None
+    return email, description, unique_signals
+
+
+# ── Email Extraction Helper ────────────────────────────────────────────
+
+
+EMAIL_REGEX = re.compile(
+    r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+)
+
+SKIP_EMAIL_PATTERNS = [
+    r'@example\.com',
+    r'@sentry\.io',
+    r'@wix\.com',
+    r'@squarespace\.com',
+    r'noreply@',
+    r'no-reply@',
+]
+
+
+def extract_emails_from_html(html):
+    """Extract email addresses from HTML content."""
+    emails = EMAIL_REGEX.findall(html)
+    filtered = []
+    for email in emails:
+        email = email.lower()
+        if any(re.search(pat, email) for pat in SKIP_EMAIL_PATTERNS):
+            continue
+        if email.endswith(('.png', '.jpg', '.gif', '.svg', '.css', '.js')):
+            continue
+        filtered.append(email)
+    return list(set(filtered))
+
+
+def scrape_all_websites():
+    """Single-pass website scraping for all businesses with a website."""
+    conn = get_connection()
+    businesses = conn.execute(
+        """SELECT id, name, website FROM businesses
+           WHERE website IS NOT NULL AND website != ''
+           AND (email IS NULL OR description IS NULL OR multi_location_signals IS NULL)"""
+    ).fetchall()
+
+    if not businesses:
+        print("No businesses need website scraping.")
+        conn.close()
+        return
+
+    print(f"Scraping websites for {len(businesses)} businesses...")
+
+    emails_found = 0
+    descriptions_found = 0
+    signals_found = 0
+
+    for i, biz in enumerate(businesses):
+        if (i + 1) % 20 == 0:
+            print(f"  Progress: {i + 1}/{len(businesses)}...")
+
+        email, description, signals = scrape_website(biz["website"])
+
+        if email:
+            update_email(conn, biz["id"], email)
+            emails_found += 1
+        if description:
+            update_description(conn, biz["id"], description)
+            descriptions_found += 1
+        if signals:
+            update_multi_location_signals(conn, biz["id"], signals)
+            signals_found += 1
+
+        if (i + 1) % 50 == 0:
+            conn.commit()
+
+        time.sleep(0.3)  # Be polite
+
+    conn.commit()
+    conn.close()
+    print(f"Website scraping complete:")
+    print(f"  Emails found: {emails_found}/{len(businesses)}")
+    print(f"  Descriptions found: {descriptions_found}/{len(businesses)}")
+    print(f"  Multi-location signals: {signals_found}/{len(businesses)}")
+
+
 def detect_multi_location_orgs():
-    """Group businesses into organizations based on website domain and name similarity."""
+    """Group businesses into organizations based on website domain, name similarity, and website signals."""
     conn = get_connection()
     businesses = get_all_businesses(conn)
 
@@ -225,18 +399,34 @@ def detect_multi_location_orgs():
 
     orgs_created = 0
 
-    # Create organizations for domain groups with multiple locations
+    # Create organizations for domain groups
     for domain, group in domain_groups.items():
-        if len(group) >= 2:
-            # Use the shortest name as the org name
-            org_name = min([b["name"] for b in group], key=len)
+        org_name = min([b["name"] for b in group], key=len)
+        location_count = len(group)
+
+        # Check if any business in this group has multi-location signals from website
+        has_website_signals = False
+        for biz in group:
+            if biz["multi_location_signals"]:
+                has_website_signals = True
+                break
+
+        # If website signals detected on a single-location domain, bump count
+        if location_count == 1 and has_website_signals:
+            notes = "Multi-location detected via website signals"
             org_id = create_organization(conn, org_name, domain,
-                                         location_count=len(group))
+                                         location_count=2, notes=notes)
+            update_organization(conn, group[0]["id"], org_id)
+            orgs_created += 1
+            print(f"  Multi-location (website signals): {org_name} ({domain})")
+        elif location_count >= 2:
+            org_id = create_organization(conn, org_name, domain,
+                                         location_count=location_count)
             for biz in group:
                 update_organization(conn, biz["id"], org_id)
             orgs_created += 1
-            print(f"  Multi-location: {org_name} ({domain}) — {len(group)} locations")
-        elif len(group) == 1:
+            print(f"  Multi-location: {org_name} ({domain}) — {location_count} locations")
+        else:
             # Single location, still create org for tracking
             biz = group[0]
             org_id = create_organization(conn, biz["name"], domain, location_count=1)
@@ -259,98 +449,6 @@ def detect_multi_location_orgs():
     print(f"\nOrganizations created: {orgs_created} multi-location groups found.")
 
 
-# ── Email Extraction ────────────────────────────────────────────────────
-
-
-EMAIL_REGEX = re.compile(
-    r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
-)
-
-# Common non-useful email patterns to skip
-SKIP_EMAIL_PATTERNS = [
-    r'@example\.com',
-    r'@sentry\.io',
-    r'@wix\.com',
-    r'@squarespace\.com',
-    r'noreply@',
-    r'no-reply@',
-]
-
-
-def extract_emails_from_html(html):
-    """Extract email addresses from HTML content."""
-    emails = EMAIL_REGEX.findall(html)
-    # Filter out junk
-    filtered = []
-    for email in emails:
-        email = email.lower()
-        if any(re.search(pat, email) for pat in SKIP_EMAIL_PATTERNS):
-            continue
-        if email.endswith(('.png', '.jpg', '.gif', '.svg', '.css', '.js')):
-            continue
-        filtered.append(email)
-    return list(set(filtered))
-
-
-def scrape_email(website_url):
-    """Try to find an email address from a business website."""
-    if not website_url:
-        return None
-
-    # Normalize URL
-    if not website_url.startswith("http"):
-        website_url = f"https://{website_url}"
-
-    # Try main page, then /contact, then /about
-    paths_to_try = ["", "/contact", "/contact-us", "/about", "/about-us"]
-
-    for path in paths_to_try:
-        url = website_url.rstrip("/") + path
-        try:
-            resp = requests.get(url, timeout=8, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; LeadGen/1.0)"
-            })
-            if resp.status_code == 200:
-                emails = extract_emails_from_html(resp.text)
-                if emails:
-                    return emails[0]  # Return the first valid email
-        except Exception:
-            continue
-
-    return None
-
-
-def extract_all_emails():
-    """Try to extract emails for all businesses that have a website but no email."""
-    conn = get_connection()
-    businesses = conn.execute(
-        "SELECT id, name, website FROM businesses WHERE website IS NOT NULL AND website != '' AND email IS NULL"
-    ).fetchall()
-
-    if not businesses:
-        print("No businesses need email extraction.")
-        conn.close()
-        return
-
-    print(f"Attempting email extraction for {len(businesses)} businesses...")
-
-    found = 0
-    for i, biz in enumerate(businesses):
-        if (i + 1) % 20 == 0:
-            print(f"  Progress: {i + 1}/{len(businesses)}...")
-
-        email = scrape_email(biz["website"])
-        if email:
-            update_email(conn, biz["id"], email)
-            found += 1
-
-        time.sleep(0.3)  # Be polite
-
-    conn.commit()
-    conn.close()
-    print(f"Found emails for {found}/{len(businesses)} businesses.")
-
-
 # ── Main ────────────────────────────────────────────────────────────────
 
 
@@ -366,14 +464,14 @@ def run_enrichment():
     calculate_all_drive_times()
 
     print("\n" + "=" * 50)
-    print("STEP 2: Detect multi-location organizations")
+    print("STEP 2: Scrape websites (email + description + multi-location signals)")
     print("=" * 50)
-    detect_multi_location_orgs()
+    scrape_all_websites()
 
     print("\n" + "=" * 50)
-    print("STEP 3: Extract emails from websites")
+    print("STEP 3: Detect multi-location organizations")
     print("=" * 50)
-    extract_all_emails()
+    detect_multi_location_orgs()
 
     print("\n" + "=" * 50)
     print("SUMMARY")

@@ -27,6 +27,7 @@ def get_ranked_leads(conn):
             b.phone,
             b.website,
             b.email,
+            b.description,
             b.rating,
             b.rating_count,
             b.primary_type,
@@ -36,6 +37,7 @@ def get_ranked_leads(conn):
             b.lat,
             b.lng,
             b.search_query,
+            b.multi_location_signals,
             o.name as org_name,
             o.website_domain as org_domain,
             o.location_count,
@@ -57,8 +59,9 @@ def export_csv(conn, filename="leads.csv"):
 
     headers = [
         "Rank", "Name", "Address", "Phone", "Website", "Email",
-        "Rating", "Reviews", "Type", "Drive Time (min)", "Drive Zone",
-        "Distance (mi)", "Org Name", "Locations", "Search Query",
+        "Description", "Rating", "Reviews", "Type", "Drive Time (min)",
+        "Drive Zone", "Distance (mi)", "Org Name", "Locations",
+        "Multi-Location Signals", "Search Query",
     ]
 
     with open(filepath, "w", newline="", encoding="utf-8") as f:
@@ -73,6 +76,7 @@ def export_csv(conn, filename="leads.csv"):
                 lead["phone"],
                 lead["website"],
                 lead["email"] or "",
+                lead["description"] or "",
                 lead["rating"] or "",
                 lead["rating_count"] or "",
                 lead["primary_type"] or "",
@@ -81,6 +85,7 @@ def export_csv(conn, filename="leads.csv"):
                 lead["distance_miles"] or "",
                 lead["org_name"] or "",
                 lead["location_count"] or 1,
+                lead["multi_location_signals"] or "",
                 lead["search_query"] or "",
             ])
 
@@ -108,8 +113,9 @@ def export_excel(conn, filename="leads.xlsx"):
 
     headers = [
         "Rank", "Name", "Address", "Phone", "Website", "Email",
-        "Rating", "Reviews", "Type", "Drive Time (min)", "Drive Zone",
-        "Distance (mi)", "Org Name", "Locations", "Search Query",
+        "Description", "Rating", "Reviews", "Type", "Drive Time (min)",
+        "Drive Zone", "Distance (mi)", "Org Name", "Locations",
+        "Multi-Location Signals", "Search Query",
     ]
 
     # Header styling
@@ -134,6 +140,7 @@ def export_excel(conn, filename="leads.xlsx"):
             lead["phone"],
             lead["website"],
             lead["email"] or "",
+            lead["description"] or "",
             lead["rating"],
             lead["rating_count"],
             lead["primary_type"] or "",
@@ -142,6 +149,7 @@ def export_excel(conn, filename="leads.xlsx"):
             lead["distance_miles"],
             lead["org_name"] or "",
             lead["location_count"] or 1,
+            lead["multi_location_signals"] or "",
             lead["search_query"] or "",
         ]
 
@@ -152,12 +160,13 @@ def export_excel(conn, filename="leads.xlsx"):
                 cell.fill = multi_loc_fill
 
     # Auto-width columns
+    from openpyxl.utils import get_column_letter
     for col in range(1, len(headers) + 1):
         max_len = max(
             len(str(ws.cell(row=r, column=col).value or ""))
             for r in range(1, min(len(leads) + 2, 100))
         )
-        ws.column_dimensions[chr(64 + col) if col <= 26 else "A" + chr(64 + col - 26)].width = min(max_len + 2, 40)
+        ws.column_dimensions[get_column_letter(col)].width = min(max_len + 2, 40)
 
     # Freeze header row
     ws.freeze_panes = "A2"
