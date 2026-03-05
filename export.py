@@ -162,7 +162,7 @@ def export_organizations_csv(conn):
             o.id, o.name, o.website_domain, o.location_count,
             o.distinct_location_count,
             GROUP_CONCAT(DISTINCT b.business_category) as categories,
-            GROUP_CONCAT(DISTINCT b.address, ' | ') as addresses
+            GROUP_CONCAT(DISTINCT b.address) as addresses
         FROM organizations o
         JOIN businesses b ON b.organization_id = o.id
         WHERE o.distinct_location_count >= 2 OR o.location_count >= 2
