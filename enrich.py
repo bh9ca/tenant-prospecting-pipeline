@@ -237,7 +237,15 @@ def normalize_address(address):
         # No numbered street found, return first two parts as-is
         return ', '.join(parts[:2]) if len(parts) >= 2 else addr
 
-    city = parts[city_idx].strip() if city_idx and city_idx < len(parts) else ""
+    # Skip comma-separated floor/suite segments to find the actual city
+    city = ""
+    if city_idx:
+        for ci in range(city_idx, len(parts)):
+            candidate = parts[ci].strip()
+            if re.match(r'^(?:\d+(?:st|nd|rd|th)\s+(?:floor|fl)\b|suite|ste|unit|apt|room|rm|bldg|building)\b', candidate):
+                continue
+            city = candidate
+            break
 
     # Strip suite/unit/floor designators
     street = re.sub(
