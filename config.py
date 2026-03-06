@@ -145,6 +145,14 @@ PRIMARY_TYPE_TO_CATEGORY = {
     "veterinary_care": "veterinary",
     "gym": "gym",
     "university": "university",
+    "spa": "cosmetic_spa",
+    "beauty_salon": "beauty_salon",
+    "hair_care": "beauty_salon",
+    "fitness_center": "gym",
+    "hotel": "hotel",
+    "store": "retail_store",
+    "consultant": "consultant",
+    "corporate_office": "institutional",
 }
 
 # Tenant fitness tiers: 1=best fit, 2=good, 3=possible, 0=skip
@@ -161,6 +169,8 @@ BUSINESS_TYPE_TIERS = {
     "medical_clinic": 3,
     "hospital_system": 0, "home_health": 0, "solo_counselor": 0,
     "veterinary": 0, "university": 0, "gym": 0, "pharmacy": 0,
+    "cosmetic_spa": 0, "beauty_salon": 0, "hotel": 0,
+    "retail_store": 0, "consultant": 0, "institutional": 0,
 }
 
 # Known hospital/health system domains — not retail tenant prospects
@@ -190,4 +200,27 @@ CATEGORY_DISPLAY_NAMES = {
     "hospital_system": "Hospital System", "home_health": "Home Health",
     "solo_counselor": "Solo Counselor", "veterinary": "Veterinary",
     "university": "University", "gym": "Gym", "pharmacy": "Pharmacy",
+    "cosmetic_spa": "Cosmetic Spa", "beauty_salon": "Beauty Salon",
+    "hotel": "Hotel", "retail_store": "Retail Store",
+    "consultant": "Consultant", "institutional": "Institutional",
 }
+
+NON_HEALTHCARE_TYPES = {
+    "spa", "beauty_salon", "hair_care", "hotel", "fitness_center",
+    "gym", "store", "consultant", "corporate_office",
+}
+
+MEDICAL_NAME_KEYWORDS = {
+    "medical", "med ", "clinic", "health", "doctor", "physician",
+    "dental", "dermatol", "therapy", "ophthalmol", "surgical",
+    "orthop", "chiro", "pediatr", "urolog", "cardio", "oncol",
+    "neurol", "gastro", "pulmon", "psych", "pharm",
+}
+
+INSTITUTIONAL_NAME_PATTERNS = [
+    r'\bsurgery center\b',
+    r'\bsurgical center\b',
+    r'\bimaging center\b',
+    r'\bmedical center\b',
+    r'\bregional hospital\b',
+]

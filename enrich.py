@@ -20,6 +20,9 @@ from config import (
     SEARCH_QUERY_TO_CATEGORY,
     PRIMARY_TYPE_TO_CATEGORY,
     HOSPITAL_SYSTEM_DOMAINS,
+    NON_HEALTHCARE_TYPES,
+    MEDICAL_NAME_KEYWORDS,
+    INSTITUTIONAL_NAME_PATTERNS,
 )
 from db import (
     get_connection,
@@ -270,19 +273,58 @@ def normalize_address(address):
 
 def classify_business_type(business):
     """
-    Classify a business into a category using search_query keywords first,
-    then hospital system domain check, then primary_type fallback.
+    Classify a business into a category. Priority chain:
+    1. Hospital system domain check
+    2. Primary type veto for non-healthcare (spa, salon, hotel, gym)
+    3. Search query keyword match
+    4. Name-based corrections for common misclassifications
+    5. Primary type fallback
     """
+    # Step 1: Hospital system domain
     domain = extract_domain(business["website"])
     if domain and domain in HOSPITAL_SYSTEM_DOMAINS:
         return "hospital_system"
 
-    search_query = (business["search_query"] or "").lower()
-    for keyword, category in SEARCH_QUERY_TO_CATEGORY:
-        if keyword in search_query:
-            return category
-
+    name_lower = (business["name"] or "").lower()
     primary_type = business["primary_type"] or ""
+
+    # Step 2: Primary type veto — non-healthcare types
+    # If Google says it's a spa/salon/hotel/gym AND the name doesn't contain
+    # medical keywords, trust Google's typing over our search query match.
+    if primary_type in NON_HEALTHCARE_TYPES:
+        has_medical_keyword = any(kw in name_lower for kw in MEDICAL_NAME_KEYWORDS)
+        if not has_medical_keyword:
+            return PRIMARY_TYPE_TO_CATEGORY.get(primary_type, "cosmetic_spa")
+
+    # Step 3: Search query keyword match (existing logic)
+    search_query = (business["search_query"] or "").lower()
+    category = None
+    for keyword, cat in SEARCH_QUERY_TO_CATEGORY:
+        if keyword in search_query:
+            category = cat
+            break
+
+    # Step 4: Name-based corrections
+    if category:
+        # Oral surgeons found via orthodontist query
+        if re.search(r'oral surg|maxillofacial', name_lower):
+            category = "oral_surgery"
+        # Eye care classified as medical_clinic
+        elif category == "medical_clinic" and re.search(r'\beye\b|vision|optical|ophthalm', name_lower):
+            category = "optometry"
+        # PT classified as medical_clinic
+        elif category == "medical_clinic" and re.search(r'physical therapy|physiotherapy', name_lower):
+            category = "physical_therapy"
+
+    if category:
+        # Institutional facility check (overrides category)
+        if re.search(r'|'.join(INSTITUTIONAL_NAME_PATTERNS), name_lower):
+            # But not if it's part of a practice name like "oral surgery center"
+            if not re.search(r'oral|dental|eye|dermatol|pain|spine', name_lower):
+                return "institutional"
+        return category
+
+    # Step 5: Primary type fallback
     if primary_type in PRIMARY_TYPE_TO_CATEGORY:
         return PRIMARY_TYPE_TO_CATEGORY[primary_type]
 

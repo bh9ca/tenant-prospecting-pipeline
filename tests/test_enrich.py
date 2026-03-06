@@ -289,9 +289,10 @@ class TestNormalizeAddress:
 class TestClassifyBusinessType:
     """Business type classification: priority chain matters."""
 
-    def _make_biz(self, search_query="", website="", primary_type=""):
+    def _make_biz(self, search_query="", website="", primary_type="", name=""):
         """Helper to create a minimal business-like dict."""
         return {
+            "name": name,
             "search_query": search_query,
             "website": website,
             "primary_type": primary_type,
@@ -345,7 +346,7 @@ class TestClassifyBusinessType:
         assert classify_business_type(biz) == "medical_clinic"
 
     def test_none_search_query(self):
-        biz = {"search_query": None, "website": None, "primary_type": None}
+        biz = {"name": None, "search_query": None, "website": None, "primary_type": None}
         assert classify_business_type(biz) == "medical_clinic"
 
     def test_search_query_case_insensitive(self):
@@ -376,6 +377,42 @@ class TestClassifyBusinessType:
     def test_physiotherapist_type_search(self):
         biz = self._make_biz(search_query="physiotherapist in Asheville NC")
         assert classify_business_type(biz) == "physical_therapy"
+
+    def test_spa_primary_type_vetoed(self):
+        biz = self._make_biz(primary_type="spa", name="Illusions Day Spa",
+                             search_query="med spa in Asheville NC")
+        assert classify_business_type(biz) == "cosmetic_spa"
+
+    def test_medical_spa_not_vetoed(self):
+        biz = self._make_biz(primary_type="beauty_salon",
+                             name="Mountain Radiance Medical Spa",
+                             search_query="med spa in Asheville NC")
+        assert classify_business_type(biz) == "med_spa"
+
+    def test_oral_surgeon_corrected(self):
+        biz = self._make_biz(search_query="orthodontist in Asheville NC",
+                             name="Asheville Oral & Maxillofacial Surgery")
+        assert classify_business_type(biz) == "oral_surgery"
+
+    def test_hotel_vetoed(self):
+        biz = self._make_biz(primary_type="hotel",
+                             name="Omni Grove Park Inn & Spa")
+        assert classify_business_type(biz) == "hotel"
+
+    def test_eye_care_corrected(self):
+        biz = self._make_biz(search_query="medical clinic in Asheville NC",
+                             name="Blue Ridge Eye Center")
+        assert classify_business_type(biz) == "optometry"
+
+    def test_institutional_surgery_center(self):
+        biz = self._make_biz(search_query="medical clinic in Asheville NC",
+                             name="Asheville Surgery Center")
+        assert classify_business_type(biz) == "institutional"
+
+    def test_oral_surgery_not_institutional(self):
+        biz = self._make_biz(search_query="oral surgeon in Asheville NC",
+                             name="Blue Ridge Oral Surgery Center")
+        assert classify_business_type(biz) == "oral_surgery"
 
 
 # ── extract_emails_from_html ────────────────────────────────────────────
