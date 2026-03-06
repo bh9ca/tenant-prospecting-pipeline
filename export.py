@@ -6,11 +6,14 @@ import os
 import sys
 from datetime import datetime
 
+from collections import defaultdict
+
 from config import (
     BUSINESS_TYPE_TIERS,
     CATEGORY_DISPLAY_NAMES,
 )
 from db import get_connection, migrate_db
+from enrich import is_provider_name, normalize_phone
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "data")
 
@@ -40,7 +43,7 @@ def compute_tier(lead):
     # Tier D: wrong business type
     if type_tier == 0:
         return "D"
-    # Tier D: already a neighbor
+    # Tier D: already a neighbor (strictly < 10 min; exactly 10.0 = included)
     if drive_min is not None and drive_min < 10:
         return "D"
 
@@ -71,6 +74,22 @@ def drive_time_sort_score(minutes):
     return 1
 
 
+def pick_representative(group):
+    """Pick the best representative row for an org group.
+
+    Prefer: practice name > has email > 10-25 min drive > highest rating > most reviews.
+    """
+    def score(lead):
+        return (
+            0 if is_provider_name(lead["name"]) else 1,  # practice name preferred
+            1 if lead["email"] else 0,
+            drive_time_sort_score(lead["drive_time_minutes"]),
+            lead["rating"] or 0,
+            lead["rating_count"] or 0,
+        )
+    return max(group, key=score)
+
+
 def get_all_leads(conn):
     """Fetch all businesses with org info, compute tier, return sorted list of dicts."""
     rows = conn.execute("""
@@ -79,6 +98,7 @@ def get_all_leads(conn):
             b.description, b.rating, b.rating_count, b.primary_type,
             b.business_category, b.drive_time_minutes, b.drive_zone,
             b.distance_miles, b.search_query, b.multi_location_signals,
+            b.organization_id,
             o.name as org_name, o.website_domain as org_domain,
             o.location_count, o.distinct_location_count
         FROM businesses b
@@ -143,16 +163,58 @@ def export_ranked_csv(leads):
     print(f"CSV exported: {filepath} ({len(leads)} leads)")
 
 
+MAX_DRIVE_TIME_PROSPECTS = 45
+
+
 def export_top_prospects_csv(leads):
-    """Export Tier A + B leads to CSV."""
+    """Export Tier A + B leads, deduplicated to one row per practice."""
     top = [l for l in leads if l["tier"] in ("A", "B")]
+
+    # Filter out far-flung locations
+    top = [l for l in top if l["drive_time_minutes"] is None
+           or l["drive_time_minutes"] <= MAX_DRIVE_TIME_PROSPECTS]
+
+    # Dedup by organization_id
+    org_groups = defaultdict(list)
+    for lead in top:
+        key = lead.get("organization_id") or f"solo_{lead['id']}"
+        org_groups[key].append(lead)
+
+    deduped = []
+    for group in org_groups.values():
+        deduped.append(pick_representative(group))
+
+    # Safety net: phone-number dedup for anything org detection missed
+    phone_seen = {}
+    final = []
+    for lead in deduped:
+        phone = normalize_phone(lead.get("phone"))
+        if phone and phone in phone_seen:
+            # Skip — already have a row for this phone number
+            continue
+        if phone:
+            phone_seen[phone] = True
+        final.append(lead)
+
+    # Re-sort after dedup
+    tier_order = {"A": 0, "B": 1, "C": 2, "D": 3}
+    final.sort(key=lambda l: (
+        tier_order.get(l["tier"], 4),
+        -(l["distinct_location_count"] or 1),
+        -drive_time_sort_score(l["drive_time_minutes"]),
+        -(1 if l["email"] else 0),
+        -(l["rating"] or 0),
+        -(l["rating_count"] or 0),
+    ))
+
     filepath = os.path.join(OUTPUT_DIR, "top_prospects.csv")
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(LEAD_CSV_HEADERS)
-        for lead in top:
+        for lead in final:
             writer.writerow(lead_to_row(lead))
-    print(f"CSV exported: {filepath} ({len(top)} top prospects)")
+    print(f"CSV exported: {filepath} ({len(final)} unique practices, "
+          f"deduped from {len(top)} entries)")
 
 
 def export_organizations_csv(conn):

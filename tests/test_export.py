@@ -6,7 +6,10 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from export import compute_tier, drive_time_sort_score, display_category, lead_to_row
+from export import (
+    compute_tier, drive_time_sort_score, display_category, lead_to_row,
+    pick_representative, MAX_DRIVE_TIME_PROSPECTS,
+)
 
 
 # ── compute_tier ────────────────────────────────────────────────────────
@@ -389,3 +392,38 @@ class TestLeadToRow:
         assert row[2] == "Dentist"
         assert row[7] == 15.2
         assert row[9] == 3
+
+
+# ── pick_representative ───────────────────────────────────────────────
+
+
+class TestPickRepresentative:
+    """Representative selection for org dedup."""
+
+    def _make_lead(self, name="Test Clinic", email=None, drive_time_minutes=15,
+                   rating=4.0, rating_count=50):
+        return {
+            "name": name,
+            "email": email,
+            "drive_time_minutes": drive_time_minutes,
+            "rating": rating,
+            "rating_count": rating_count,
+        }
+
+    def test_pick_representative_prefers_practice_name(self):
+        provider = self._make_lead(name="John Smith, MD", rating=4.9)
+        practice = self._make_lead(name="Asheville Eye Associates", rating=4.0)
+        result = pick_representative([provider, practice])
+        assert result["name"] == "Asheville Eye Associates"
+
+    def test_pick_representative_prefers_email(self):
+        no_email = self._make_lead(name="Clinic A", email=None)
+        has_email = self._make_lead(name="Clinic B", email="info@clinic.com")
+        result = pick_representative([no_email, has_email])
+        assert result["name"] == "Clinic B"
+
+    def test_drive_time_max_filter(self):
+        """Leads with drive time > MAX_DRIVE_TIME_PROSPECTS should be filtered."""
+        assert MAX_DRIVE_TIME_PROSPECTS == 45
+        # This tests the constant is set correctly; the actual filtering
+        # happens in export_top_prospects_csv which filters leads > 45 min
