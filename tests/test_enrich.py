@@ -17,6 +17,9 @@ from enrich import (
     normalize_address,
     classify_business_type,
     extract_emails_from_html,
+    is_provider_name,
+    pick_org_name,
+    normalize_phone,
 )
 
 
@@ -530,3 +533,60 @@ class TestExtractEmailsFromHtml:
         html = "info@ashevilledental.com"
         result = extract_emails_from_html(html)
         assert "info@ashevilledental.com" in result
+
+
+# ── is_provider_name ──────────────────────────────────────────────────
+
+
+class TestIsProviderName:
+    """Provider name detection: person vs practice."""
+
+    def test_is_provider_name_with_md(self):
+        assert is_provider_name("Jordan S Masters, MD") is True
+
+    def test_is_provider_name_with_dds(self):
+        assert is_provider_name("John Smith, DDS") is True
+
+    def test_is_provider_name_with_dr_prefix(self):
+        assert is_provider_name("Dr. Jane Doe") is True
+
+    def test_is_provider_name_practice(self):
+        assert is_provider_name("Asheville Eye Associates") is False
+
+    def test_is_provider_name_plain_practice(self):
+        assert is_provider_name("Blue Ridge Dental") is False
+
+
+# ── pick_org_name ─────────────────────────────────────────────────────
+
+
+class TestPickOrgName:
+    """Org name selection: practice name over provider name."""
+
+    def test_pick_org_name_prefers_practice(self):
+        assert pick_org_name(["Jordan S Masters, MD", "Asheville Eye Associates"]) == "Asheville Eye Associates"
+
+    def test_pick_org_name_longest_practice(self):
+        assert pick_org_name(["Eye Associates", "Asheville Eye Associates"]) == "Asheville Eye Associates"
+
+    def test_pick_org_name_all_providers(self):
+        assert pick_org_name(["John Smith, MD", "Jane Doe, MD"]) == "John Smith, MD"
+
+
+# ── normalize_phone ───────────────────────────────────────────────────
+
+
+class TestNormalizePhone:
+    """Phone normalization for grouping."""
+
+    def test_normalize_phone_strips_formatting(self):
+        assert normalize_phone("(828) 555-1234") == "8285551234"
+
+    def test_normalize_phone_with_country_code(self):
+        assert normalize_phone("+1-828-555-1234") == "8285551234"
+
+    def test_normalize_phone_none(self):
+        assert normalize_phone(None) is None
+
+    def test_normalize_phone_empty(self):
+        assert normalize_phone("") is None

@@ -564,6 +564,38 @@ def scrape_all_websites():
     print(f"  Multi-location signals: {signals_found}/{len(businesses)}")
 
 
+PROVIDER_SUFFIX_PATTERN = re.compile(
+    r',?\s*\b(MD|DDS|DMD|DO|PA-C|PA|NP|FNP|OD|DPM|DC|PT|DPT|'
+    r'LCSW|LPC|PhD|PsyD|MAGD|FAGD|MHS|MPT|FACS|RN|APRN|CNM|'
+    r'FAAD|FAAOS|Jr|Sr|III|IV)\b'
+    r'|^(Dr|Mr|Ms|Mrs)\.?\s',
+    re.IGNORECASE
+)
+
+
+def is_provider_name(name):
+    """True if name looks like a person (provider) rather than a practice."""
+    return bool(PROVIDER_SUFFIX_PATTERN.search(name))
+
+
+def pick_org_name(names):
+    """Pick practice name over provider name. Prefer longest practice name."""
+    practice_names = [n for n in names if not is_provider_name(n)]
+    if practice_names:
+        return max(practice_names, key=len)
+    return max(names, key=len)
+
+
+def normalize_phone(phone):
+    """Strip phone to last 10 digits for comparison."""
+    if not phone:
+        return None
+    digits = re.sub(r'\D', '', phone)
+    if len(digits) >= 10:
+        return digits[-10:]
+    return digits if digits else None
+
+
 def detect_multi_location_orgs():
     """
     Group businesses into organizations and count distinct physical locations.
@@ -603,7 +635,7 @@ def detect_multi_location_orgs():
 
     # Create organizations for domain groups
     for domain, group in domain_groups.items():
-        org_name = min([b["name"] for b in group], key=len)
+        org_name = pick_org_name([b["name"] for b in group])
         location_count = len(group)
 
         # Count distinct physical locations by normalized address
@@ -647,10 +679,96 @@ def detect_multi_location_orgs():
             print(f"  Multi-location: {org_name} ({domain}) — "
                   f"{distinct_count} distinct / {location_count} entries")
 
+    # --- Pass 2: Phone + address grouping for ungrouped businesses ---
+    # This catches providers at the same practice with different/no websites.
+    # Key insight: independent practices sharing a building have DIFFERENT phones.
+    # Providers at the same practice share the SAME phone (one front desk).
+
+    ungrouped = conn.execute("""
+        SELECT b.id, b.name, b.phone, b.address, b.organization_id, b.website,
+               o.location_count
+        FROM businesses b
+        LEFT JOIN organizations o ON b.organization_id = o.id
+        WHERE b.phone IS NOT NULL AND b.phone != ''
+    """).fetchall()
+
+    # Build phone+address groups
+    phone_addr_groups = defaultdict(list)
+    for biz in ungrouped:
+        norm_phone = normalize_phone(biz["phone"])
+        norm_addr = normalize_address(biz["address"])
+        if norm_phone and norm_addr:
+            key = (norm_phone, norm_addr)
+            phone_addr_groups[key].append(biz)
+
+    for (phone, addr), group in phone_addr_groups.items():
+        if len(group) < 2:
+            continue
+
+        # Collect all unique org_ids in this group
+        org_ids = set(biz["organization_id"] for biz in group if biz["organization_id"])
+
+        if len(org_ids) <= 1 and all(biz["organization_id"] for biz in group):
+            # All already in the same org — nothing to do
+            continue
+
+        # Pick the best org name from all names in this group
+        all_names = [biz["name"] for biz in group]
+        best_name = pick_org_name(all_names)
+
+        # Find if any existing org should be the target
+        target_org_id = None
+        if org_ids:
+            # Use existing org, update its name
+            target_org_id = list(org_ids)[0]
+            conn.execute("UPDATE organizations SET name = ? WHERE id = ?",
+                         (best_name, target_org_id))
+        else:
+            # Create new org
+            domain = extract_domain(group[0]["website"]) if group[0]["website"] else None
+            target_org_id = create_organization(conn, best_name, domain,
+                                               location_count=len(group))
+
+        # Merge: point all businesses to the target org
+        for biz in group:
+            if biz["organization_id"] != target_org_id:
+                update_organization(conn, biz["id"], target_org_id)
+
+        # Delete orphaned orgs
+        for old_org_id in org_ids:
+            if old_org_id != target_org_id:
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM businesses WHERE organization_id = ?",
+                    (old_org_id,)
+                ).fetchone()[0]
+                if remaining == 0:
+                    conn.execute("DELETE FROM organizations WHERE id = ?", (old_org_id,))
+
+        # Update location count and distinct locations
+        total = conn.execute(
+            "SELECT COUNT(*) FROM businesses WHERE organization_id = ?",
+            (target_org_id,)
+        ).fetchone()[0]
+        conn.execute("UPDATE organizations SET location_count = ? WHERE id = ?",
+                    (total, target_org_id))
+
+        # Recalculate distinct addresses
+        addrs = conn.execute(
+            "SELECT address FROM businesses WHERE organization_id = ?",
+            (target_org_id,)
+        ).fetchall()
+        distinct = len(set(normalize_address(a["address"]) for a in addrs))
+        update_org_distinct_locations(conn, target_org_id, distinct)
+
+        print(f"  Phone+addr merge: {best_name} ({phone[-4:]}) — "
+              f"{len(group)} entries, {distinct} distinct locations")
+
+    conn.commit()
+
     # Create organizations for name groups
     for norm_name, group in name_groups.items():
         if len(group) >= 2:
-            org_name = min([b["name"] for b in group], key=len)
+            org_name = pick_org_name([b["name"] for b in group])
             addr_map = defaultdict(list)
             for biz in group:
                 norm_addr = normalize_address(biz["address"])
