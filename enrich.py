@@ -416,11 +416,26 @@ EMAIL_REGEX = re.compile(
 
 SKIP_EMAIL_PATTERNS = [
     r'@example\.com',
-    r'@sentry\.io',
+    r'@sentry',                    # sentry.io, sentry.wixpress.com, sentry-next.wixpress.com
     r'@wix\.com',
+    r'@wixpress\.com',
     r'@squarespace\.com',
+    r'@wordpress\.com',
+    r'@godaddy\.com',
+    r'@mailchimp\.com',
+    r'@hubspot\.com',
+    r'@constantcontact\.com',
     r'noreply@',
     r'no-reply@',
+    r'^user@domain\.com',
+    r'^example@',                  # example@email.com, example@domain.com
+    r'^your@email\.com',
+    r'^email@email\.com',
+    r'^first\.last@company\.com',
+    r'^test@',
+    r'^hi@mystore\.com',
+    r'^xx@',                       # xx@xxxx.xx placeholder pattern
+    r'^filler@',
 ]
 
 
@@ -432,10 +447,30 @@ def extract_emails_from_html(html):
         email = email.lower()
         if any(re.search(pat, email) for pat in SKIP_EMAIL_PATTERNS):
             continue
-        if email.endswith(('.png', '.jpg', '.gif', '.svg', '.css', '.js')):
+        if email.endswith(('.png', '.jpg', '.gif', '.svg', '.css', '.js', '.webp', '.avif')):
             continue
         filtered.append(email)
     return list(set(filtered))
+
+
+def clean_junk_emails():
+    """Remove junk/placeholder emails from existing data."""
+    conn = get_connection()
+    businesses = conn.execute(
+        "SELECT id, email FROM businesses WHERE email IS NOT NULL"
+    ).fetchall()
+    cleaned = 0
+    for biz in businesses:
+        email = biz["email"].lower()
+        if any(re.search(pat, email) for pat in SKIP_EMAIL_PATTERNS):
+            update_email(conn, biz["id"], None)
+            cleaned += 1
+        elif email.endswith(('.png', '.jpg', '.gif', '.svg', '.css', '.js', '.webp', '.avif')):
+            update_email(conn, biz["id"], None)
+            cleaned += 1
+    conn.commit()
+    conn.close()
+    print(f"Cleaned {cleaned} junk emails.")
 
 
 def scrape_all_websites():
@@ -617,12 +652,17 @@ def run_enrichment():
     scrape_all_websites()
 
     print("\n" + "=" * 50)
-    print("STEP 3: Classify business types")
+    print("STEP 3: Clean junk emails")
+    print("=" * 50)
+    clean_junk_emails()
+
+    print("\n" + "=" * 50)
+    print("STEP 4: Classify business types")
     print("=" * 50)
     classify_all_business_types()
 
     print("\n" + "=" * 50)
-    print("STEP 4: Detect multi-location organizations")
+    print("STEP 5: Detect multi-location organizations")
     print("=" * 50)
     detect_multi_location_orgs()
 

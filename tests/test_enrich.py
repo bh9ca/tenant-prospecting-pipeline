@@ -458,3 +458,38 @@ class TestExtractEmailsFromHtml:
         html = "icon@logo.svg"
         result = extract_emails_from_html(html)
         assert len(result) == 0
+
+    def test_skips_user_at_domain(self):
+        html = "user@domain.com"
+        result = extract_emails_from_html(html)
+        assert len(result) == 0
+
+    def test_skips_example_prefix(self):
+        html = "example@anything.com"
+        result = extract_emails_from_html(html)
+        assert len(result) == 0
+
+    def test_skips_xx_prefix(self):
+        html = "xx@xxxx.xx"
+        result = extract_emails_from_html(html)
+        assert len(result) == 0
+
+    def test_skips_wixpress(self):
+        html = "tracking@sentry-next.wixpress.com"
+        result = extract_emails_from_html(html)
+        assert len(result) == 0
+
+    def test_skips_mailchimp(self):
+        html = "mc@mailchimp.com"
+        result = extract_emails_from_html(html)
+        assert len(result) == 0
+
+    def test_skips_webp_extension(self):
+        html = "image@2x.webp"
+        result = extract_emails_from_html(html)
+        assert len(result) == 0
+
+    def test_keeps_real_email(self):
+        html = "info@ashevilledental.com"
+        result = extract_emails_from_html(html)
+        assert "info@ashevilledental.com" in result
