@@ -6,8 +6,14 @@ import sqlite3
 from config import DB_PATH
 
 
+def ensure_db_dir():
+    """Ensure the database directory exists."""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+
 def get_connection():
     """Get a connection to the SQLite database."""
+    ensure_db_dir()
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -17,7 +23,7 @@ def get_connection():
 
 def init_db():
     """Create database tables if they don't exist."""
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    ensure_db_dir()
     conn = get_connection()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS organizations (
@@ -87,6 +93,7 @@ def init_db():
 
 def migrate_db():
     """Add columns that may not exist in older schemas."""
+    init_db()
     conn = get_connection()
     biz_cols = {r[1] for r in conn.execute("PRAGMA table_info(businesses)").fetchall()}
     org_cols = {r[1] for r in conn.execute("PRAGMA table_info(organizations)").fetchall()}

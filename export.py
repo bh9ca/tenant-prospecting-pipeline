@@ -18,6 +18,11 @@ from enrich import is_provider_name, normalize_phone
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "data")
 
 
+def ensure_output_dir():
+    """Ensure export output directory exists."""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
 def display_category(category):
     """Convert internal category to human-readable label."""
     return CATEGORY_DISPLAY_NAMES.get(category, category or "Unknown")
@@ -154,6 +159,7 @@ def lead_to_row(lead):
 
 def export_ranked_csv(leads):
     """Export all leads ranked by tier to CSV."""
+    ensure_output_dir()
     filepath = os.path.join(OUTPUT_DIR, "leads_ranked.csv")
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -168,6 +174,7 @@ MAX_DRIVE_TIME_PROSPECTS = 45
 
 def export_top_prospects_csv(leads):
     """Export Tier A + B leads, deduplicated to one row per practice."""
+    ensure_output_dir()
     top = [l for l in leads if l["tier"] in ("A", "B")]
 
     # Filter out far-flung locations
@@ -219,6 +226,7 @@ def export_top_prospects_csv(leads):
 
 def export_organizations_csv(conn):
     """Export multi-location organizations to CSV."""
+    ensure_output_dir()
     orgs = conn.execute("""
         SELECT
             o.id, o.name, o.website_domain, o.location_count,
@@ -255,6 +263,7 @@ def export_organizations_csv(conn):
 
 def export_excel(conn, leads):
     """Export to Excel with tier-based sheets."""
+    ensure_output_dir()
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill, Alignment
